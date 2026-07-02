@@ -3,6 +3,7 @@ package apidump
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,6 +30,7 @@ import (
 	"github.com/postmanlabs/postman-insights-agent/pcap"
 	"github.com/postmanlabs/postman-insights-agent/plugin"
 	"github.com/postmanlabs/postman-insights-agent/printer"
+	"github.com/postmanlabs/postman-insights-agent/proxy"
 	"github.com/postmanlabs/postman-insights-agent/rest"
 	"github.com/postmanlabs/postman-insights-agent/tcp_conn_tracker"
 	"github.com/postmanlabs/postman-insights-agent/telemetry"
@@ -164,6 +166,17 @@ type Args struct {
 
 	// Whether to drop traffic to/from nginx
 	DropNginxTraffic bool
+
+	// Reverse-proxy capture mode. When ReverseProxyListen is set, the agent
+	// accepts HTTP(S) traffic on that address, forwards it to
+	// ReverseProxyUpstream, and captures each exchange. Because the agent is a
+	// TLS endpoint in this mode, it observes traffic that is encrypted on the
+	// wire, which passive capture cannot.
+	ReverseProxyListen              string
+	ReverseProxyUpstream            string
+	ReverseProxyTLSCert             string
+	ReverseProxyTLSKey              string
+	ReverseProxyUpstreamTLSInsecure bool
 
 	DaemonsetArgs optionals.Optional[DaemonsetArgs]
 
@@ -695,10 +708,15 @@ func (a *apidump) Run() error {
 	// Get the interfaces to listen on.
 	interfaces, err := getEligibleInterfaces(args.Interfaces, targetNetworkNamespace)
 	if err != nil {
-		a.SendErrorTelemetry(GetErrorTypeWithDefault(err, api_schema.ApidumpError_PCAPInterfaceOther), err)
-		return errors.Wrap(err, "No network interfaces could be used")
-	}
+		if args.ReverseProxyListen == "" {
+			a.SendErrorTelemetry(GetErrorTypeWithDefault(err, api_schema.ApidumpError_PCAPInterfaceOther), err)
+			return errors.Wrap(err, "No network interfaces could be used")
+		}
 
+		// The reverse proxy is its own capture source; it does not need pcap.
+		printer.Warningf("No network interfaces could be used for packet capture (%v). Continuing with reverse-proxy capture only.\n", err)
+		interfaces = nil
+	}
 	// Build the user-specified filter and its negation for each interface.
 	userFilters, negationFilters, err := createBPFFilters(interfaces, args.Filter, capturingNegation, 0)
 	if err != nil {
@@ -823,8 +841,12 @@ func (a *apidump) Run() error {
 
 	// Synchronization for collectors + collector errors, each of which is run in a separate goroutine.
 	var doneWG sync.WaitGroup
-	doneWG.Add(len(userFilters) + len(negationFilters))
-	errChan := make(chan interfaceError, len(userFilters)+len(negationFilters)) // buffered enough so it never blocks
+	numCaptureSources := len(userFilters) + len(negationFilters)
+	if args.ReverseProxyListen != "" {
+		numCaptureSources++
+	}
+	doneWG.Add(numCaptureSources)
+	errChan := make(chan interfaceError, numCaptureSources) // buffered enough so it never blocks
 	stop := make(chan struct{})
 
 	// If a discovery traffic TTL was provided by the backend, start a timer that
@@ -857,6 +879,113 @@ func (a *apidump) Run() error {
 		return errors.Wrapf(err, "unable to instantiate redactor for %s", a.backendSvc)
 	}
 
+	// Builds the collector stack that sits in front of a capture source: the
+	// back-end sink, statistics, subsampling, path/host filters, and
+	// (optionally) TCP/TLS connection tracking. Shared between the pcap
+	// interfaces and the reverse-proxy listener.
+	newCollectorStack := func(summary *trace.PacketCounter, isNegation bool, countPrefilter bool, withConnTrackers bool) (trace.Collector, error) {
+		var collector trace.Collector
+
+		// Back-end collector (sink).
+		if isNegation {
+			// During debugging, we capture the negation of the user's filters. This
+			// allows us to report statistics for packets not matching the user's
+			// filters. We need to avoid sending this traffic to the back end,
+			// however.
+			collector = trace.NewDummyCollector()
+		} else {
+			var backendCollector trace.Collector
+			if args.Out.AkitaURI != nil {
+				backendCollector = trace.NewBackendCollector(
+					a.backendSvc,
+					traceTags,
+					backendLrn,
+					a.learnClient,
+					redactor,
+					optionals.Some(a.MaxWitnessSize_bytes),
+					summary,
+					args.ReproMode,
+					optionals.Some(args.AlwaysCapturePayloads),
+					args.Plugins,
+					args.MaxWitnessUploadBuffers,
+					apidumpTelemetry,
+				)
+
+				collector = backendCollector
+			} else {
+				return nil, errors.Errorf("invalid output location")
+			}
+
+			// If the backend collector supports rotation of learn session ID, then set that up.
+			if lsc, ok := backendCollector.(trace.LearnSessionCollector); ok && lsc != nil {
+				toRotate = append(toRotate, lsc)
+			}
+		}
+
+		// Statistics.
+		//
+		// Count packets that have *passed* filtering (so that we know whether the
+		// trace is empty or not.)  In the future we could add columns for both
+		// pre- and post-filtering.
+		collector = &trace.PacketCountCollector{
+			PacketCounts:     summary,
+			Collector:        collector,
+			SuccessTelemetry: a.successTelemetry,
+		}
+
+		// Subsampling.
+		collector = trace.NewSamplingCollector(args.SampleRate, collector)
+		if rateLimit != nil {
+			collector = rateLimit.NewCollector(collector, summary)
+		}
+
+		// Path and host filters.
+		if len(hostExclusions) > 0 {
+			collector = trace.NewHTTPHostFilterCollector(hostExclusions, collector)
+		}
+		if len(pathExclusions) > 0 {
+			collector = trace.NewHTTPPathFilterCollector(pathExclusions, collector)
+		}
+		if len(hostAllowlist) > 0 {
+			collector = trace.NewHTTPHostAllowlistCollector(hostAllowlist, collector)
+		}
+		if len(pathAllowlist) > 0 {
+			collector = trace.NewHTTPPathAllowlistCollector(pathAllowlist, collector)
+		}
+
+		// Eliminate Akita CLI traffic, unless --dogfood has been specified
+		dropDogfoodTraffic := !viper.GetBool("dogfood")
+
+		// Construct userTrafficCollector
+		if dropDogfoodTraffic || a.DropNginxTraffic {
+			collector = &trace.UserTrafficCollector{
+				Collector:          collector,
+				DropDogfoodTraffic: dropDogfoodTraffic,
+				DropNginxTraffic:   a.DropNginxTraffic,
+			}
+		}
+
+		// Count packets before user filters for diagnostics
+		if countPrefilter {
+			collector = &trace.PacketCountCollector{
+				PacketCounts: prefilterSummary,
+				Collector:    collector,
+			}
+		}
+
+		// If this is false, we will still parse TLS client and server hello messages
+		// but not process them futher.
+		if withConnTrackers && args.CollectTCPAndTLSReports {
+			// Process TLS traffic into TLS-connection metadata.
+			collector = tls_conn_tracker.NewCollector(collector)
+
+			// Process TCP-packet metadata into TCP-connection metadata.
+			collector = tcp_conn_tracker.NewCollector(collector)
+		}
+
+		return collector, nil
+	}
+
 	// Start collecting -- set up one or two collectors per interface, depending on whether filters are in use
 	numCollectors := 0
 	for _, filterState := range []filterState{matchedFilter, notMatchedFilter} {
@@ -871,113 +1000,9 @@ func (a *apidump) Run() error {
 		}
 
 		for interfaceName, filter := range filters {
-			var collector trace.Collector
-
-			// Build collectors from the inside out (last applied to first applied).
-			//  8. Back-end collector (sink).
-			//  7. Statistics.
-			//  6. Subsampling.
-			//  5. Path and host filters.
-			//  4. Eliminate Akita CLI traffic.
-			//  3. Count packets before user filters for diagnostics.
-			//  2. Process TLS traffic into TLS-connection metadata.
-			//  1. Aggregate TCP-packet metadata into TCP-connection metadata.
-
-			// Back-end collector (sink).
-			if filterState == notMatchedFilter {
-				// During debugging, we capture the negation of the user's filters. This
-				// allows us to report statistics for packets not matching the user's
-				// filters. We need to avoid sending this traffic to the back end,
-				// however.
-				collector = trace.NewDummyCollector()
-			} else {
-				var backendCollector trace.Collector
-				if args.Out.AkitaURI != nil {
-					backendCollector = trace.NewBackendCollector(
-						a.backendSvc,
-						traceTags,
-						backendLrn,
-						a.learnClient,
-						redactor,
-						optionals.Some(a.MaxWitnessSize_bytes),
-						summary,
-						args.ReproMode,
-						optionals.Some(args.AlwaysCapturePayloads),
-						args.Plugins,
-						args.MaxWitnessUploadBuffers,
-						apidumpTelemetry,
-					)
-
-					collector = backendCollector
-				} else {
-					return errors.Errorf("invalid output location")
-				}
-
-				// If the backend collector supports rotation of learn session ID, then set that up.
-				if lsc, ok := backendCollector.(trace.LearnSessionCollector); ok && lsc != nil {
-					toRotate = append(toRotate, lsc)
-				}
-			}
-
-			// Statistics.
-			//
-			// Count packets that have *passed* filtering (so that we know whether the
-			// trace is empty or not.)  In the future we could add columns for both
-			// pre- and post-filtering.
-			collector = &trace.PacketCountCollector{
-				PacketCounts:     summary,
-				Collector:        collector,
-				SuccessTelemetry: a.successTelemetry,
-			}
-
-			// Subsampling.
-			collector = trace.NewSamplingCollector(args.SampleRate, collector)
-			if rateLimit != nil {
-				collector = rateLimit.NewCollector(collector, summary)
-			}
-
-			// Path and host filters.
-			if len(hostExclusions) > 0 {
-				collector = trace.NewHTTPHostFilterCollector(hostExclusions, collector)
-			}
-			if len(pathExclusions) > 0 {
-				collector = trace.NewHTTPPathFilterCollector(pathExclusions, collector)
-			}
-			if len(hostAllowlist) > 0 {
-				collector = trace.NewHTTPHostAllowlistCollector(hostAllowlist, collector)
-			}
-			if len(pathAllowlist) > 0 {
-				collector = trace.NewHTTPPathAllowlistCollector(pathAllowlist, collector)
-			}
-
-			// Eliminate Akita CLI traffic, unless --dogfood has been specified
-			dropDogfoodTraffic := !viper.GetBool("dogfood")
-
-			// Construct userTrafficCollector
-			if dropDogfoodTraffic || a.DropNginxTraffic {
-				collector = &trace.UserTrafficCollector{
-					Collector:          collector,
-					DropDogfoodTraffic: dropDogfoodTraffic,
-					DropNginxTraffic:   a.DropNginxTraffic,
-				}
-			}
-
-			// Count packets before user filters for diagnostics
-			if filterState == matchedFilter && numUserFilters > 0 {
-				collector = &trace.PacketCountCollector{
-					PacketCounts: prefilterSummary,
-					Collector:    collector,
-				}
-			}
-
-			// If this is false, we will still parse TLS client and server hello messages
-			// but not process them futher.
-			if args.CollectTCPAndTLSReports {
-				// Process TLS traffic into TLS-connection metadata.
-				collector = tls_conn_tracker.NewCollector(collector)
-
-				// Process TCP-packet metadata into TCP-connection metadata.
-				collector = tcp_conn_tracker.NewCollector(collector)
+			collector, err := newCollectorStack(summary, filterState == notMatchedFilter, filterState == matchedFilter && numUserFilters > 0, true)
+			if err != nil {
+				return err
 			}
 
 			// Compute the share of the page cache that each collection process may use.
@@ -1009,6 +1034,44 @@ func (a *apidump) Run() error {
 				}
 			}(interfaceName, filter)
 		}
+	}
+
+	// Reverse-proxy capture source. The proxy terminates TLS itself, so it
+	// yields witnesses for HTTPS (and HTTP/2) traffic that passive packet
+	// capture cannot parse.
+	if args.ReverseProxyListen != "" {
+		upstreamURL, err := url.Parse(args.ReverseProxyUpstream)
+		if err != nil {
+			return errors.Wrapf(err, "invalid reverse-proxy upstream URL %q", args.ReverseProxyUpstream)
+		}
+
+		collector, err := newCollectorStack(filterSummary, false, numUserFilters > 0, false)
+		if err != nil {
+			return err
+		}
+
+		proxySrv, err := proxy.New(proxy.Args{
+			ListenAddr:          args.ReverseProxyListen,
+			Upstream:            upstreamURL,
+			TLSCertFile:         args.ReverseProxyTLSCert,
+			TLSKeyFile:          args.ReverseProxyTLSKey,
+			UpstreamTLSInsecure: args.ReverseProxyUpstreamTLSInsecure,
+		}, collector, pool)
+		if err != nil {
+			return errors.Wrap(err, "failed to start reverse proxy")
+		}
+		printer.Infof("Reverse proxy listening on %s, forwarding to %s\n", proxySrv.Addr(), args.ReverseProxyUpstream)
+
+		numCollectors++
+		go func() {
+			defer doneWG.Done()
+			if err := proxySrv.Serve(stop); err != nil {
+				errChan <- interfaceError{
+					interfaceName: proxy.InterfaceName,
+					err:           errors.Wrap(err, "reverse proxy stopped"),
+				}
+			}
+		}()
 	}
 
 	if len(toRotate) > 0 && args.LearnSessionLifetime != time.Duration(0) {

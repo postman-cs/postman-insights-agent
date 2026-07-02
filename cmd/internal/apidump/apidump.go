@@ -314,6 +314,12 @@ func apidumpRunInternal(_ *cobra.Command, _ []string) error {
 		HealthCheckPort:         healthCheckPort,
 		DropNginxTraffic:        viper.GetBool("drop-nginx-traffic"),
 
+		ReverseProxyListen:              reverseProxyListenFlag,
+		ReverseProxyUpstream:            reverseProxyUpstreamFlag,
+		ReverseProxyTLSCert:             reverseProxyTLSCertFlag,
+		ReverseProxyTLSKey:              reverseProxyTLSKeyFlag,
+		ReverseProxyUpstreamTLSInsecure: reverseProxyUpstreamTLSInsecureFlag,
+
 		// TODO: remove the SendWitnessPayloads flag once all existing users are migrated to new flag.
 		ReproMode: commonApidumpFlags.EnableReproMode || commonApidumpFlags.SendWitnessPayloads,
 
