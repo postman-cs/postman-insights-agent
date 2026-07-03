@@ -70,6 +70,14 @@ func (m *GoManager) AttachGoTLS(pid uint32, path string) error {
 		for _, c := range att.links {
 			_ = c.Close()
 		}
+		_ = m.loader.DeleteGoidOffset(pid)
+	}
+
+	// Publish this binary's runtime.g.goid offset keyed by PID BEFORE attaching
+	// any uprobe, so no entry/RET probe can fire without its correlation offset
+	// in place. This is what lets one scope mix Go major versions safely.
+	if err := m.loader.SetGoidOffset(pid, goidOffset(path)); err != nil {
+		return fmt.Errorf("gotls: set goid offset pid=%d: %w", pid, err)
 	}
 
 	type hook struct {
@@ -125,6 +133,7 @@ func (m *GoManager) Detach(pid uint32) error {
 		return nil
 	}
 	_ = m.loader.DeleteTargetPID(pid)
+	_ = m.loader.DeleteGoidOffset(pid)
 	return closeLinks(att.links)
 }
 

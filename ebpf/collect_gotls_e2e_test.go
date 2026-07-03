@@ -103,7 +103,6 @@ func TestGoTLSDiscoveryE2E(t *testing.T) {
 		t.Fatalf("NewGoTLSCollector: %v", err)
 	}
 	defer func() { _ = collector.Close() }()
-	t.Logf("collector goid_offset=%d", collector.GoidOffset())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

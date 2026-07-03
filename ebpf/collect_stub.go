@@ -79,7 +79,6 @@ func NewGoTLSCollector(_ uint32, _ *events.Adapter, _ string) (*GoTLSCollector, 
 
 func (c *GoTLSCollector) Run(_ context.Context, _ time.Time) {}
 func (c *GoTLSCollector) Close() error                       { return nil }
-func (c *GoTLSCollector) GoidOffset() uint64                 { return 0 }
 func (c *GoTLSCollector) AttachedPIDs() []uint32             { return nil }
 func (c *GoTLSCollector) CounterEmitted() uint64             { return 0 }
 func (c *GoTLSCollector) CounterMissingStash() uint64        { return 0 }

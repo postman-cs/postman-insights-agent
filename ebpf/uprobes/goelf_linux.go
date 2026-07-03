@@ -241,8 +241,3 @@ func goidOffsetFromVersion(path string) uint64 {
 	}
 	return 0
 }
-
-// GoidOffset returns the runtime.g.goid offset for the Go binary at path (0
-// if it cannot be determined). Exported for the go_tls collector, which loads
-// it as a BPF constant. See goidOffset for resolution details.
-func GoidOffset(path string) uint64 { return goidOffset(path) }

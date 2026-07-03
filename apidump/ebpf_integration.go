@@ -320,7 +320,7 @@ func startHTTPSeBPFCapture(
 			printer.Stderr.Warningf(
 				"ebpf: go_tls unavailable (build without insights_bpf tag?): %v\n", err)
 		} else {
-			printer.Stderr.Infof("ebpf: go_tls collector started (goid_offset=%d)\n", goCollector.GoidOffset())
+			printer.Stderr.Infof("ebpf: go_tls collector started (per-PID goid offsets)\n")
 			wg.Add(1)
 			go func() {
 				defer wg.Done()

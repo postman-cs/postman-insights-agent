@@ -41,10 +41,9 @@ func TestGoTLSCaptureE2E(t *testing.T) {
 	const marker = "hello-plaintext-9f3a"
 
 	self := "/proc/self/exe"
-	goidOff := goidOffset(self)
-	t.Logf("resolved runtime.g.goid offset = %d", goidOff)
+	t.Logf("resolved runtime.g.goid offset = %d (published per-PID by AttachGoTLS)", goidOffset(self))
 
-	l, err := loader.LoadGoTLS(loader.GoTLSMaxCaptureForTest(), false, goidOff)
+	l, err := loader.LoadGoTLS(loader.GoTLSMaxCaptureForTest(), false)
 	if err != nil {
 		t.Fatalf("LoadGoTLS: %v", err)
 	}

@@ -31,10 +31,11 @@ type GoTLSLoader struct {
 }
 
 // LoadGoTLS instantiates the go_tls BPF collection. enforceAllowlist gates
-// whether non-allowlisted PIDs emit; goidOffset is the byte offset of
-// runtime.g.goid for the target's Go version (0 => the BPF program falls back
-// to the OS tid as the entry/return correlation key).
-func LoadGoTLS(maxCaptureBytes uint32, enforceAllowlist bool, goidOffset uint64) (*GoTLSLoader, error) {
+// whether non-allowlisted PIDs emit. The runtime.g.goid offset is no longer a
+// load-time constant: it is published per-PID via SetGoidOffset when each Go
+// binary is attached, so a scope mixing Go major versions correlates every PID
+// on its own offset.
+func LoadGoTLS(maxCaptureBytes uint32, enforceAllowlist bool) (*GoTLSLoader, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("ebpf: remove memlock: %w", err)
 	}
@@ -54,9 +55,6 @@ func LoadGoTLS(maxCaptureBytes uint32, enforceAllowlist bool, goidOffset uint64)
 	}
 	if err := spec.Variables["go_max_capture_bytes"].Set(maxCaptureBytes); err != nil {
 		return nil, fmt.Errorf("ebpf: set go_max_capture_bytes: %w", err)
-	}
-	if err := spec.Variables["go_goid_offset"].Set(goidOffset); err != nil {
-		return nil, fmt.Errorf("ebpf: set go_goid_offset: %w", err)
 	}
 	objs := &gotlsObjects{}
 	if err := spec.LoadAndAssign(objs, &ebpf.CollectionOptions{}); err != nil {
@@ -91,6 +89,19 @@ func (l *GoTLSLoader) AddTargetPID(pid uint32) error {
 // DeleteTargetPID removes a PID from the capture allowlist.
 func (l *GoTLSLoader) DeleteTargetPID(pid uint32) error {
 	return l.gotls.GoTargetPids.Delete(&pid)
+}
+
+// SetGoidOffset publishes the runtime.g.goid byte offset for pid's Go binary.
+// The attach path calls this BEFORE attaching pid's uprobes so the entry/RET
+// correlation keys on the correct goid for that binary's Go version. An offset
+// of 0 means "unknown"; the BPF program then falls back to the OS tid.
+func (l *GoTLSLoader) SetGoidOffset(pid uint32, offset uint64) error {
+	return l.gotls.GoGoidOffsets.Update(&pid, &offset, ebpf.UpdateAny)
+}
+
+// DeleteGoidOffset removes pid's published goid offset (on detach).
+func (l *GoTLSLoader) DeleteGoidOffset(pid uint32) error {
+	return l.gotls.GoGoidOffsets.Delete(&pid)
 }
 
 // Program accessors used by the uprobes package to attach at resolved offsets.

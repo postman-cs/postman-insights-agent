@@ -32,26 +32,22 @@ type GoTLSCollector struct {
 	adapter  *events.Adapter
 	procRoot string
 	interval time.Duration
-	goidOff  uint64
 
 	mu     sync.Mutex
 	closed bool
 }
 
 // NewGoTLSCollector loads the go_tls programs and constructs a collector that
-// feeds captured plaintext into the supplied adapter. The BPF program carries
-// a single runtime.g.goid offset (used to correlate the entry and RET
-// uprobes); the collector self-configures it from the first Go binary it can
-// see under procRoot, falling back to the value that is stable across Go
-// 1.18-1.25 when no Go workload is running yet. Heterogeneous Go *major*
-// versions inside one scope would need per-PID offsets -- see the design
-// doc's limitations section.
+// feeds captured plaintext into the supplied adapter. The runtime.g.goid
+// offset is resolved and published per-PID as each Go binary is attached (see
+// GoManager.AttachGoTLS), so a scope mixing Go *major* versions whose goid
+// offsets differ correlates every PID on its own offset -- no single load-time
+// constant, no minority-version mis-keying.
 func NewGoTLSCollector(maxCaptureBytes uint32, adapter *events.Adapter, procRoot string) (*GoTLSCollector, error) {
 	if adapter == nil {
 		return nil, fmt.Errorf("ebpf: GoTLSCollector requires an Adapter")
 	}
-	goidOff := resolveGoidOffset(procRoot)
-	l, err := loader.LoadGoTLS(maxCaptureBytes, false, goidOff)
+	l, err := loader.LoadGoTLS(maxCaptureBytes, false)
 	if err != nil {
 		return nil, err
 	}
@@ -67,30 +63,8 @@ func NewGoTLSCollector(maxCaptureBytes uint32, adapter *events.Adapter, procRoot
 		adapter:  adapter,
 		procRoot: procRoot,
 		interval: 5 * time.Second,
-		goidOff:  goidOff,
 	}, nil
 }
-
-// resolveGoidOffset scans procRoot for the first Go+crypto/tls process and
-// returns its runtime.g.goid offset. Returns the Go 1.18-1.25 default (152)
-// when no such process is visible yet or the offset can't be read.
-func resolveGoidOffset(procRoot string) uint64 {
-	if ts, err := discovery.ScanProcGoAt(procRoot); err == nil {
-		for _, t := range ts {
-			if t.Go == nil {
-				continue
-			}
-			if off := uprobes.GoidOffset(t.Go.HostPath); off != 0 {
-				return off
-			}
-		}
-	}
-	return 152
-}
-
-// GoidOffset returns the runtime.g.goid offset the BPF program was loaded
-// with (diagnostics / tests).
-func (c *GoTLSCollector) GoidOffset() uint64 { return c.goidOff }
 
 // AttachedPIDs returns the PIDs currently attached (diagnostics / tests).
 func (c *GoTLSCollector) AttachedPIDs() []uint32 { return c.mgr.AttachedPIDs() }

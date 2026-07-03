@@ -48,13 +48,6 @@ char LICENSE[] SEC("license") = "GPL";
 // 0 = trace all PIDs; 1 = only PIDs present in go_target_pids.
 volatile const __u32 go_enforce_pid_allowlist = 0;
 
-// Byte offset of runtime.g.goid within the g struct. Version-dependent; the
-// Go loader resolves it (version table or DWARF) and rewrites it at load time.
-// 0 means "unknown" — we then fall back to bpf_get_current_pid_tgid()'s tid as
-// a coarse correlation key (correct for the common one-goroutine-per-call
-// case; a real goid is preferred once resolved).
-volatile const __u64 go_goid_offset = 0;
-
 // Runtime-adjustable capture cap (thermostat can lower it). The loader MUST
 // keep this <= MAX_EVENT_PAYLOAD-1 so the mask in go_tls_ret is a no-op; the
 // mask (not this value) is what proves the read length bounded to the verifier.
@@ -76,6 +69,19 @@ struct {
     __type(key, __u32);   // tgid
     __type(value, __u8);
 } go_target_pids SEC(".maps");
+
+// Per-PID runtime.g.goid byte offset. The Go loader resolves each binary's
+// offset (DWARF or version table) and publishes it here keyed by tgid BEFORE
+// attaching that PID's uprobes, so a scope mixing Go major versions whose goid
+// offsets differ keys each PID's entry/RET correlation correctly. A tgid absent
+// from this map (or mapped to 0) falls back to the OS tid as a coarse key —
+// correct for the common single-goroutine-per-call case.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u32);   // tgid
+    __type(value, __u64); // runtime.g.goid byte offset
+} go_goid_offsets SEC(".maps");
 
 // Entry->return correlation. Keyed by (tgid, goid); value carries the args we
 // need at the RET site.
@@ -156,9 +162,12 @@ static __always_inline __u64 go_g_ptr(struct pt_regs *ctx) { return ctx->regs[28
 #error "go_tls: unsupported target architecture"
 #endif
 
-// Resolve the current goroutine id. Returns 0 if unknown.
-static __always_inline __u64 go_goid(struct pt_regs *ctx) {
-    if (go_goid_offset == 0) {
+// Resolve the current goroutine id using this PID's published goid offset.
+// Returns 0 if the offset is unknown (PID not yet configured) or the read
+// fails, so the caller falls back to the OS tid as a coarse key.
+static __always_inline __u64 go_goid(struct pt_regs *ctx, __u32 tgid) {
+    __u64 *offp = bpf_map_lookup_elem(&go_goid_offsets, &tgid);
+    if (!offp || *offp == 0) {
         return 0;
     }
     __u64 g = go_g_ptr(ctx);
@@ -166,7 +175,7 @@ static __always_inline __u64 go_goid(struct pt_regs *ctx) {
         return 0;
     }
     __u64 goid = 0;
-    if (bpf_probe_read_user(&goid, sizeof(goid), (void *)(g + go_goid_offset)) != 0) {
+    if (bpf_probe_read_user(&goid, sizeof(goid), (void *)(g + *offp)) != 0) {
         return 0;
     }
     return goid;
@@ -176,7 +185,7 @@ static __always_inline void go_make_key(struct go_op_key *k, __u32 tgid,
                                         struct pt_regs *ctx) {
     __builtin_memset(k, 0, sizeof(*k));
     k->tgid = tgid;
-    __u64 goid = go_goid(ctx);
+    __u64 goid = go_goid(ctx, tgid);
     // Fall back to the OS tid when the goid offset is unknown. Correct for the
     // overwhelmingly-common single-goroutine-per-call case.
     k->goid = goid ? goid : (bpf_get_current_pid_tgid() & 0xffffffff);
