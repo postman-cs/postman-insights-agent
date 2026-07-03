@@ -13,7 +13,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target native -cc clang -cflags "-O2 -g -Wall -Werror" javatls ../programs/java_tls.bpf.c -- -I../programs
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target native -cc clang -cflags "-O2 -g -Wall -Werror -Wno-missing-declarations" javatls ../programs/java_tls.bpf.c -- -I../programs
 
 // JavaTLSLoader owns the kernel-side java_tls program. Unlike libssl (one
 // shared Loader, many per-target uprobe links) and unlike gotls (one loader
