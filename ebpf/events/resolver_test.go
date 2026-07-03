@@ -14,6 +14,14 @@ import (
 // connection in the current process, finds the fd via /proc/self/fd, and
 // verifies the resolver extracts the correct 4-tuple.
 func TestResolverAgainstRealSocket(t *testing.T) {
+	// The resolver reads /proc/<pid>/fd and /proc/<pid>/net/tcp{,6}, which
+	// exist only on Linux. Skip on dev hosts (e.g. macOS) that lack /proc so
+	// the suite stays green outside the eBPF build environment; CI on Linux
+	// still exercises the real path.
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("resolver requires a Linux /proc filesystem")
+	}
+
 	// Listen on a random port.
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
