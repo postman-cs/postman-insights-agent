@@ -10,7 +10,7 @@ also emits Go bindings in the parent `ebpf/loader/` package.
 |---|---|---|
 | `event.h` | ABI-stable event struct shared with Go. | 1 |
 | `libssl.bpf.c` | Uprobes for `SSL_read`/`SSL_write`/`SSL_read_ex`/`SSL_write_ex`. | 1 |
-| `go_tls.bpf.c` | Uprobes for `crypto/tls.(*Conn).Read`/`Write` and Go HTTP layer. | 3 (TODO — not yet started) |
+| `go_tls.bpf.c` | Uprobes for `crypto/tls.(*Conn).Read`/`Write`; discovery-native per-PID attach. | 3 ✅ |
 | `java_tls.bpf.c` | Kprobe on `sys_ioctl` for Java agent bridge. | 5 ✅ |
 
 ## Build prerequisites
