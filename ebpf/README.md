@@ -2,35 +2,41 @@
 
 This package adds **HTTPS traffic capture** to the Postman Insights Agent via eBPF uprobes on userspace TLS libraries. The full design lives in [`docs/https-capture-design.md`](../docs/https-capture-design.md).
 
-## Current status (after Phases 1 + 2)
+## Current status
 
-The libssl uprobe → ringbuf → adapter → akinet pipeline is end-to-end
-functional on Linux 5.8+. The `apidump --enable-https-capture` flag turns
-it on in production.
+The libssl uprobe → ringbuf → resolver → adapter → akinet pipeline is
+end-to-end functional on Linux 5.8+, wired into production via
+`apidump --enable-https-capture` and the `kube inject --enable-https-capture`
+DaemonSet path. Java TLS capture (JVM ioctl bridge) and a mutating admission
+webhook that injects the agent + java-agent are also landed.
 
 | Component | Status |
 |---|---|
-| BPF C source (`programs/libssl.bpf.c`) | ✅ Compiles, loads past verifier on kernel 6.12 first try |
-| Go loader (`loader/`) | ✅ bpf2go bindings generated and committed (arm64; amd64 deferred to CI runner) |
+| BPF C source (`programs/libssl.bpf.c`) | ✅ Compiles, loads past verifier on kernel 6.12 |
+| BPF C source (`programs/java_tls.bpf.c`) | ✅ Kprobe on the JVM ioctl bridge |
+| Go loader (`loader/`) | ✅ bpf2go bindings (arm64 committed; amd64 generated in the eBPF build container / CI) |
 | Ringbuf reader (`events/reader_linux.go`) | ✅ |
 | Decoder (`events/decode.go`) | ✅ |
-| Adapter to akinet (`events/adapter.go`) | ✅ Real `Parse()` loop with pipelining, chunked delivery, 64 KiB cap, 6 unit tests |
-| Process discovery (`discovery/`) | 🟡 Polling `/proc` works; CRI/Kube integration deferred to follow-up |
-| Uprobe attachment (`uprobes/`) | ✅ Dynamic libssl (OpenSSL 1.1 & 3.x); static BoringSSL in `node` exe (official Node 20+) |
+| Adapter to akinet (`events/adapter.go`) | ✅ `Parse()` loop with pipelining, chunked delivery, 64 KiB cap |
+| fd → 4-tuple resolution (`events/resolver.go`) | ✅ Per-PID `/proc/<pid>/net/tcp{,6}` cache + 5 ms proactive pre-resolve loop |
+| Process discovery (`discovery/`) | ✅ `/proc` scan/watch + CRI/Kube namespace resolver (cgroup-ns-inode bridging) |
+| Uprobe attachment (`uprobes/`) | ✅ Dynamic libssl (OpenSSL 1.1 & 3.x); static BoringSSL in `node` (Node 20+) |
 | Top-level `Collect()` | ✅ |
 | Spike command (`cmd/internal/apidump-ebpf/`) | ✅ Validated against curl, Python `requests`, Node `https.get` |
-| `apidump --enable-https-capture` integration | ✅ Wired into the production `apidump` command (dedicated collector chain reusing data_masks / rate_limit / backend_collector) |
+| `apidump --enable-https-capture` integration | ✅ Dedicated collector chain reusing data_masks / rate_limit / backend_collector |
+| `kube inject --enable-https-capture` | ✅ Adds CAP_BPF + CAP_PERFMON, hostPID, hostPath mounts to the sidecar |
+| Mutating admission webhook + Helm chart | ✅ `cmd/internal/kube-webhook/` + `charts/postman-insights-webhook/` |
 | cBPF port-443 exclusion | ✅ `--https-cbpf-exclude-port` (default 443) |
-| DaemonSet privileges | 🟡 Helper code present (`SidecarOpts.EnableHTTPSCapture`, `HTTPSCaptureVolumes`); not yet wired into `kube inject` / `helm-fragment` / `tf-fragment` |
 | Sampling layer 1 (body truncation) | ✅ |
-| Sampling layers 2 & 5 (rate cap, CPU thermostat) | ❌ Deferred |
-| Telemetry counters | 🟡 Counters exist on adapter; not yet wired into `telemetry/` |
-| fd → 4-tuple resolution | ❌ Deferred — IPs zero, PID in Interface field |
-| End-to-end on a kind cluster | ❌ Deferred (requires Docker-in-Docker or real Linux host) |
+| Sampling layer 2 (per-PID rate cap) | ✅ `ratecap_linux.go` |
+| Sampling layer 5 (CPU thermostat) | ✅ `thermostat_linux.go` |
+| Telemetry counters | ✅ `httpsTelemetryWorker` emits `ebpf_capture_stats` every 30 s |
+| **Go `crypto/tls` capture (`programs/go_tls.bpf.c`)** | ❌ Not started — see "What's left" |
+| amd64 bpf2go objects as a release artifact | 🟡 Built in the eBPF dev container; not yet a committed release-image artifact |
+| End-to-end on a kind cluster | 🟡 Manifests + scripts present (`docs/kind-e2e-demo-presentation.md`); needs a Linux/DinD runner |
 
-See `docs/phases/phase-1-results.md` and `docs/phases/phase-2-results.md` for
-actual measurement numbers, deviations from the design doc, and the
-recommended follow-up sequence.
+Phase result write-ups live in [`docs/phases/`](../docs/phases/) and
+[`docs/progress.md`](../docs/progress.md).
 
 ## Build tags
 
@@ -55,7 +61,8 @@ make dev-shell          # open a shell inside it (repo bind-mounted, --pid=host)
 
 # Inside the shell:
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/programs/vmlinux.h
-make build-ebpf         # generates bpf2go bindings + builds insights_bpf binary
+go generate ./ebpf/loader/...                                     # runs bpf2go (needs clang + vmlinux.h)
+go build -tags insights_bpf -o bin/postman-insights-agent .
 ./bin/postman-insights-agent apidump-ebpf --duration 60s          # spike
 # or for the production path:
 ./bin/postman-insights-agent apidump --enable-https-capture --project ...
@@ -65,7 +72,8 @@ make build-ebpf         # generates bpf2go bindings + builds insights_bpf binary
 
 ```bash
 sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > ebpf/programs/vmlinux.h
-make build-ebpf
+go generate ./ebpf/loader/...
+go build -tags insights_bpf -o bin/postman-insights-agent .
 sudo ./bin/postman-insights-agent apidump-ebpf --duration 60s
 ```
 
@@ -90,7 +98,8 @@ ebpf/
 ├── programs/                    BPF C sources, compiled to .o by bpf2go
 │   ├── README.md
 │   ├── event.h                  shared struct ssl_event {…}
-│   └── libssl.bpf.c             uprobes for SSL_read/SSL_write/*_ex
+│   ├── libssl.bpf.c             uprobes for SSL_read/SSL_write/*_ex
+│   └── java_tls.bpf.c           kprobe on the JVM ioctl bridge
 │
 ├── loader/                      cilium/ebpf loader + bpf2go invocation
 │   ├── loader.go                package doc
@@ -111,23 +120,24 @@ ebpf/
 │   └── attach_stub.go           no-op (other builds)
 │
 └── discovery/                   target-PID enumeration
-    └── proc.go                  scan + watch /proc; Phase 2 adds CRI integration
+    ├── proc.go                  scan + watch /proc for PIDs with libssl loaded
+    └── kube_linux.go            CRI + cgroup-ns-inode → k8s-namespace resolver
 ```
 
-## What's left after Phases 1 + 2
+## What's left
 
-1. **fd → 4-tuple resolution.** Largest functional gap; the
-   `origin/feature/capture-https` branch has a working
-   `socketResolver` worth porting.
-2. **CRI/Kube discovery.** Replace `/proc` polling with inotify + a kube
-   watch+cache.
-3. **Sampling layers 2 & 5.** Per-PID rate-cap in BPF; CPU thermostat in Go.
-4. **Telemetry wiring.** Counters exist on the adapter; need a 30-second
-   emit loop hooked into the existing `telemetry/` pipeline.
-5. **Kube subcommand integration.** `--enable-https-capture` on
-   `kube inject`, `helm-fragment`, `tf-fragment`.
-6. **CI.** amd64 cross-compile of BPF objects; `make build-ebpf` in
-   `.circleci/config.yml`; release `Dockerfile` updated to embed bpf2go
-   output.
-7. **End-to-end kind-cluster test.** Once (1)–(5) land, walk a kind
-   cluster through the namespace-filtering exit criterion.
+1. **Go `crypto/tls` capture (`programs/go_tls.bpf.c`).** The one substantive
+   functional gap, and the highest-value item for a Go-heavy fleet. Go
+   statically links its own TLS stack (no libssl to hook), and the Go runtime
+   moves goroutine stacks, so naive uretprobes are unreliable. The proven
+   approach (Pixie / Beyla / OBI) attaches uprobes on
+   `crypto/tls.(*Conn).Read`/`Write` and locates return sites by scanning the
+   function body for RET instructions, reading arguments/results per Go's
+   register ABI. Must be built, verifier-checked, and runtime-validated inside
+   the eBPF dev container (`build-scripts/dev-container.sh`).
+2. **amd64 BPF objects as a release artifact.** bpf2go emits arm64 + amd64,
+   but only arm64 objects are committed; CI should generate amd64 in the eBPF
+   container and embed both in the release image.
+3. **End-to-end kind-cluster test.** Manifests + scripts exist
+   (`docs/kind-e2e-demo-presentation.md`); needs a Linux or Docker-in-Docker
+   runner to exercise the namespace-filtering exit criterion.

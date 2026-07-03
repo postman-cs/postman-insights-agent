@@ -308,5 +308,27 @@ func startHTTPSeBPFCapture(
 		}
 	}
 
+	// Go TLS capture — the discovery-native uprobe path. Runs its own process
+	// discovery and attaches go_tls uprobes to every Go binary linking
+	// crypto/tls, with no per-service config and no agent injection. Feeds the
+	// same `out` channel (and thus the same collector chain) as libssl/Java.
+	if args.HTTPS.EnableGoTLS {
+		goAdapter := events.NewAdapter(selector, out)
+		goAdapter.Resolver = events.NewResolverWithProcRoot(1*time.Second, ebpfArgs.ProcRoot)
+		goCollector, err := ebpf.NewGoTLSCollector(bodyCap, goAdapter, ebpfArgs.ProcRoot)
+		if err != nil {
+			printer.Stderr.Warningf(
+				"ebpf: go_tls unavailable (build without insights_bpf tag?): %v\n", err)
+		} else {
+			printer.Stderr.Infof("ebpf: go_tls collector started (per-PID goid offsets)\n")
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() { _ = goCollector.Close() }()
+				goCollector.Run(captureCtx, time.Now())
+			}()
+		}
+	}
+
 	return cancel
 }

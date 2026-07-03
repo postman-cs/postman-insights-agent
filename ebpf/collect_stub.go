@@ -19,7 +19,7 @@ import (
 // to *ebpf.Thermostat in their telemetry plumbing.
 type Thermostat struct{}
 
-func (*Thermostat) CurrentCap() uint32   { return 0 }
+func (*Thermostat) CurrentCap() uint32  { return 0 }
 func (*Thermostat) CPUPercent() float64 { return 0 }
 
 // Args is the platform-neutral declaration so callers can construct it
@@ -58,13 +58,27 @@ func NewJavaTLSCollector(_ uint32, _ bool, _ *events.Adapter) (*JavaTLSCollector
 	return nil, ErrUnsupported
 }
 
-func (c *JavaTLSCollector) Attach() error                              { return ErrUnsupported }
-func (c *JavaTLSCollector) Run(_ context.Context, _ time.Time)        {}
-func (c *JavaTLSCollector) Close() error                              { return nil }
-func (c *JavaTLSCollector) AddTargetPID(_ uint32) error               { return nil }
-func (c *JavaTLSCollector) RemoveTargetPID(_ uint32) error            { return nil }
-func (c *JavaTLSCollector) CounterEmitted() uint64                    { return 0 }
-func (c *JavaTLSCollector) CounterRingbufDrops() uint64               { return 0 }
-func (c *JavaTLSCollector) CounterReadFailed() uint64                 { return 0 }
-func (c *JavaTLSCollector) CounterBytes() uint64                      { return 0 }
-func (c *JavaTLSCollector) CounterBadCmd() uint64                     { return 0 }
+func (c *JavaTLSCollector) Attach() error                      { return ErrUnsupported }
+func (c *JavaTLSCollector) Run(_ context.Context, _ time.Time) {}
+func (c *JavaTLSCollector) Close() error                       { return nil }
+func (c *JavaTLSCollector) AddTargetPID(_ uint32) error        { return nil }
+func (c *JavaTLSCollector) RemoveTargetPID(_ uint32) error     { return nil }
+func (c *JavaTLSCollector) CounterEmitted() uint64             { return 0 }
+func (c *JavaTLSCollector) CounterRingbufDrops() uint64        { return 0 }
+func (c *JavaTLSCollector) CounterReadFailed() uint64          { return 0 }
+func (c *JavaTLSCollector) CounterBytes() uint64               { return 0 }
+func (c *JavaTLSCollector) CounterBadCmd() uint64              { return 0 }
+
+// GoTLSCollector is a stub on non-eBPF builds. The real implementation lives
+// in collect_gotls_linux.go (//go:build linux && insights_bpf).
+type GoTLSCollector struct{}
+
+func NewGoTLSCollector(_ uint32, _ *events.Adapter, _ string) (*GoTLSCollector, error) {
+	return nil, ErrUnsupported
+}
+
+func (c *GoTLSCollector) Run(_ context.Context, _ time.Time) {}
+func (c *GoTLSCollector) Close() error                       { return nil }
+func (c *GoTLSCollector) AttachedPIDs() []uint32             { return nil }
+func (c *GoTLSCollector) CounterEmitted() uint64             { return 0 }
+func (c *GoTLSCollector) CounterMissingStash() uint64        { return 0 }

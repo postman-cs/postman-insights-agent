@@ -157,6 +157,13 @@ type HTTPSCaptureArgs struct {
 	// Requires postman-java-agent.jar to be injected into target JVMs (via the
 	// kube-webhook or manually). Has no effect when Enabled is false.
 	EnableJavaTLS bool
+
+	// EnableGoTLS, when true, also runs the discovery-native go_tls collector
+	// that captures Go crypto/tls traffic via uprobes on
+	// crypto/tls.(*Conn).Write/Read. Unlike EnableJavaTLS it needs no agent
+	// injection: any discovered Go binary linking crypto/tls is attached
+	// automatically. Has no effect when Enabled is false.
+	EnableGoTLS bool
 }
 
 type Args struct {

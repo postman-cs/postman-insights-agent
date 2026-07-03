@@ -26,7 +26,8 @@ import (
 // that disappeared. The receiver branches on Removed.
 type Target struct {
 	PID     uint32
-	Lib     *uprobes.LibSSLPath // populated when Removed == false
+	Lib     *uprobes.LibSSLPath // populated when Removed == false (libssl target)
+	Go      *uprobes.GoExePath  // populated when Removed == false (Go crypto/tls target)
 	Seen    time.Time
 	Removed bool // true → process has exited; uprobes should be detached
 }
@@ -68,6 +69,12 @@ type WatchOpts struct {
 	// Use this in the DaemonSet per-pod path to avoid N× duplicate captures
 	// when a namespace has multiple pod replicas (horizontal scaling).
 	NetnsInodeFilter uint64
+
+	// DetectGo, when true, additionally emits Target{Go: ...} for processes
+	// whose executable is a Go binary linking crypto/tls (and has no libssl).
+	// Off by default so the libssl discovery path is byte-for-byte unchanged;
+	// the go_tls collector sets it.
+	DetectGo bool
 }
 
 // ScanProc walks /proc once and returns every PID that has a libssl mapping.
@@ -77,7 +84,19 @@ func ScanProc() ([]Target, error) { return ScanProcAt("/proc") }
 // ScanProcAt walks the specified /proc mount and returns every PID that has
 // a libssl mapping. Use /host/proc when running inside a DaemonSet so the
 // scanned PIDs match BPF's root-namespace view.
-func ScanProcAt(procRoot string) ([]Target, error) {
+func ScanProcAt(procRoot string) ([]Target, error) { return scanProcAt(procRoot, false) }
+
+// ScanProcGoAt is ScanProcAt with Go crypto/tls detection enabled: PIDs whose
+// executable is a Go binary linking crypto/tls (and has no libssl) are
+// returned as Target{Go: ...}. Used by the go_tls collector's discovery loop.
+func ScanProcGoAt(procRoot string) ([]Target, error) { return scanProcAt(procRoot, true) }
+
+// scanProcAt walks procRoot once. Every PID with a libssl mapping is returned
+// as Target{Lib: ...}; when detectGo is set, PIDs with no libssl but a Go
+// crypto/tls executable are returned as Target{Go: ...}. libssl takes
+// precedence, so a cgo binary linking both is captured via the (more mature)
+// libssl path.
+func scanProcAt(procRoot string, detectGo bool) ([]Target, error) {
 	if procRoot == "" {
 		procRoot = "/proc"
 	}
@@ -105,11 +124,16 @@ func ScanProcAt(procRoot string) ([]Target, error) {
 			continue
 		}
 
-		lib, err := uprobes.FindLibSSLAnyAt(procRoot, pid)
-		if err != nil {
+		if lib, err := uprobes.FindLibSSLAnyAt(procRoot, pid); err == nil {
+			targets = append(targets, Target{PID: pid, Lib: lib, Seen: now})
 			continue
 		}
-		targets = append(targets, Target{PID: pid, Lib: lib, Seen: now})
+
+		if detectGo {
+			if goExe, err := uprobes.FindGoExeAt(procRoot, pid); err == nil {
+				targets = append(targets, Target{PID: pid, Go: goExe, Seen: now})
+			}
+		}
 	}
 
 	return targets, nil
@@ -183,7 +207,7 @@ func WatchWith(ctx context.Context, opts WatchOpts) <-chan Target {
 		defer t.Stop()
 
 		scan := func() {
-			ts, err := ScanProcAt(opts.ProcRoot)
+			ts, err := scanProcAt(opts.ProcRoot, opts.DetectGo)
 			if err != nil {
 				return
 			}
